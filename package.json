@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "console": "node console-app.js"
+    "console": "node console-app.js",
+    "build": "npm install && npx playwright install --with-deps chromium",
+    "postinstall": "npx playwright install --with-deps chromium || true"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -12,7 +14,8 @@
     "pino": "^8.15.0",
     "rate-limiter-flexible": "^2.4.1",
     "dotenv": "^16.3.1",
-    "tiktok-signature": "^3.0.0",
-    "tiktok-live-connector": "^2.0.8"
+    "tiktok-signature": "^2.1.3",
+    "tiktok-live-connector": "^2.0.8",
+    "playwright": "^1.40.0"
   }
 }
