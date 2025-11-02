@@ -5,8 +5,8 @@
   "scripts": {
     "start": "node server.js",
     "console": "node console-app.js",
-    "build": "npm install && npx playwright install --with-deps chromium",
-    "postinstall": "npx playwright install --with-deps chromium || true"
+    "build": "npm install && npx playwright install chromium",
+    "postinstall": "npx playwright install chromium || true"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -19,6 +19,6 @@
     "playwright": "^1.40.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18.x"
   }
 }
