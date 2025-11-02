@@ -4,8 +4,18 @@ import cors from "cors";
 import pino from "pino";
 import { RateLimiterMemory } from "rate-limiter-flexible";
 import dotenv from "dotenv";
+import { execSync } from "child_process";
 
 dotenv.config();
+
+// === AUTO-INSTALL CHROMIUM AT RUNTIME ===
+try {
+  console.log("🧩 Checking Chromium installation...");
+  execSync("npx playwright install chromium", { stdio: "inherit" });
+  console.log("✅ Chromium installed or already available.");
+} catch (e) {
+  console.warn("⚠️ Playwright Chromium install failed, continuing anyway.", e);
+}
 
 const log = pino();
 const app = express();
@@ -13,30 +23,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Rate limiter (per IP)
+// === RATE LIMITER ===
 const limiter = new RateLimiterMemory({
-  points: Number(process.env.RATE_LIMIT_POINTS || 60), // requests
-  duration: Number(process.env.RATE_LIMIT_DURATION || 60), // seconds
+  points: Number(process.env.RATE_LIMIT_POINTS || 60),
+  duration: Number(process.env.RATE_LIMIT_DURATION || 60),
 });
 
-// Signer holder
+// === SIGNER HOLDER ===
 let signer = null;
 let signerReady = false;
 let signerInfo = { source: null };
 
-// Helper: attempt to dynamically import a signer implementation.
-// Recommended install: npm i github:carcabot/tiktok-signature
+// === LOAD SIGNER FUNCTION ===
 async function loadSigner() {
   if (signerReady) return;
   try {
-    // Try to import the common package name first
-    // Users should install one of the compatible signer packages or github repo.
-    // Example: npm i github:carcabot/tiktok-signature
     const mod = await import("tiktok-signature");
     signerInfo.source = "tiktok-signature";
-    // The module can export either:
-    // - an async function sign(url)
-    // - an object/class with init() and sign()/generate() methods
+
     if (typeof mod.sign === "function") {
       signer = {
         sign: mod.sign.bind(mod),
@@ -48,7 +52,11 @@ async function loadSigner() {
         const instance = new Default();
         signer = {
           instance,
-          sign: typeof instance.sign === "function" ? instance.sign.bind(instance) : (instance.generate ? instance.generate.bind(instance) : null),
+          sign: typeof instance.sign === "function"
+            ? instance.sign.bind(instance)
+            : instance.generate
+            ? instance.generate.bind(instance)
+            : null,
           init: typeof instance.init === "function" ? instance.init.bind(instance) : null,
         };
       } else if (typeof mod.default.sign === "function") {
@@ -58,9 +66,9 @@ async function loadSigner() {
         };
       }
     }
-    // If a signer requires initialization (puppeteer), call init with recommended options.
+
+    // === INIT SIGNER (Playwright) ===
     if (signer && signer.init) {
-      // Provide safe default launch options for common cloud hosts
       try {
         await signer.init?.({
           launchOptions: {
@@ -73,39 +81,49 @@ async function loadSigner() {
           },
         });
       } catch (e) {
-        log.warn({ err: e }, "Signer init() threw an error (continuing; sign() may still work)");
+        log.warn({ err: e }, "Signer init() failed — continuing anyway.");
       }
     }
 
     if (!signer || typeof signer.sign !== "function") {
-      log.warn("Imported module did not expose a usable .sign function. Signer not ready.");
+      log.warn("Signer invalid or missing sign() method.");
       signer = null;
     } else {
       signerReady = true;
-      log.info({ source: signerInfo.source }, "Signer loaded and ready");
+      log.info({ source: signerInfo.source }, "✅ Signer loaded successfully.");
     }
   } catch (err) {
-    // No installed signer found
-    log.warn({ err }, "No compatible signer package found. Install github:carcabot/tiktok-signature (or compatible fork).");
+    log.warn({ err }, "No compatible signer found. Install github:carcabot/tiktok-signature.");
     signer = null;
     signerReady = false;
   }
 }
 
-// call loader at startup (non-blocking)
+// === AUTO-RELOAD SIGNER ON CRASH ===
+process.on("uncaughtException", async (err) => {
+  console.error("❌ Uncaught exception:", err);
+  if (err.message?.includes("browserType.launch")) {
+    console.log("🔁 Reinitializing signer after browser crash...");
+    signerReady = false;
+    signer = null;
+    await loadSigner();
+  }
+});
+
+// === INITIAL LOAD ===
 loadSigner().catch((e) => log.error({ e }, "Signer loader failed"));
 
-// Middleware: basic rate-limit
+// === RATE LIMIT MIDDLEWARE ===
 app.use(async (req, res, next) => {
   try {
     await limiter.consume(req.ip);
     return next();
-  } catch (err) {
-    res.status(429).json({ success: false, error: "Too many requests" });
+  } catch {
+    return res.status(429).json({ success: false, error: "Too many requests" });
   }
 });
 
-// Health
+// === HEALTH CHECK ===
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -115,72 +133,35 @@ app.get("/", (req, res) => {
   });
 });
 
-// GET or POST /sign
-// GET: /sign?url=...
-// POST: { "url": "..." }
+// === SIGN ENDPOINT ===
 app.all("/sign", async (req, res) => {
   try {
-    // check query/body
     const url = (req.method === "GET" ? req.query.url : req.body?.url) || null;
     if (!url || typeof url !== "string") {
       return res.status(400).json({ success: false, error: "Missing 'url' parameter" });
     }
 
-    // ensure signer loaded - try to load on-demand
-    if (!signerReady) {
-      await loadSigner();
-    }
-
+    if (!signerReady) await loadSigner();
     if (!signer || typeof signer.sign !== "function") {
-      // optional proxy fallback if you want to use a public signer
-      const proxyFallback = process.env.SIGN_PROXY_FALLBACK || "";
-      if (proxyFallback) {
-        // proxy to fallback signer
-        try {
-          const fallbackUrl = `${proxyFallback}?url=${encodeURIComponent(url)}`;
-          log.info("Proxying sign request to fallback:", fallbackUrl);
-          const fetch = (await import("node-fetch")).default;
-          const r = await fetch(fallbackUrl, { method: "GET" });
-          const body = await r.json();
-          return res.status(r.status).json(body);
-        } catch (err) {
-          log.error({ err }, "Proxy fallback failed");
-          return res.status(502).json({ success: false, error: "Proxy fallback failed" });
-        }
-      }
-
-      return res.status(503).json({
-        success: false,
-        error:
-          "Signer not available. Install a compatible signer (e.g. github:carcabot/tiktok-signature) and restart the server.",
-      });
+      return res.status(503).json({ success: false, error: "Signer not available" });
     }
 
-    // signer.sign may accept (url) and return various shapes.
     let result;
     try {
       result = await signer.sign(url);
     } catch (err) {
-      // Some implementations expose different method names (generate/signUrl)
-      if (signer.instance && typeof signer.instance.generate === "function") {
-        result = await signer.instance.generate(url);
-      } else if (signer.instance && typeof signer.instance.signUrl === "function") {
-        result = await signer.instance.signUrl(url);
-      } else {
-        throw err;
-      }
+      if (signer.instance?.generate) result = await signer.instance.generate(url);
+      else if (signer.instance?.signUrl) result = await signer.instance.signUrl(url);
+      else throw err;
     }
 
-    // Normalize result: library may return string or object
+    if (!result) return res.status(500).json({ success: false, error: "Empty result from signer" });
+
     let signedUrl = null;
     let signature = null;
-    if (!result) {
-      return res.status(500).json({ success: false, error: "Signer returned empty result" });
-    }
 
     if (typeof result === "string") {
       signedUrl = result;
-      // try to extract X-Bogus param if present
       try {
         const u = new URL(result);
         signature = u.searchParams.get("X-Bogus") || null;
@@ -192,30 +173,16 @@ app.all("/sign", async (req, res) => {
       signature = result.signature ?? result.X_Bogus ?? result.x_bogus ?? null;
     }
 
-    // If still no signedUrl, try to compute from result.raw or fallback
-    if (!signedUrl && result.raw && typeof result.raw === "string") {
-      signedUrl = result.raw;
-    }
-
-    if (!signedUrl) {
+    if (!signedUrl)
       return res.status(500).json({ success: false, error: "Could not normalize signer output", raw: result });
-    }
 
-    // success
-    const out = {
-      success: true,
-      signedUrl,
-      signature,
-      timestamp: Date.now(),
-      raw: result,
-    };
-    // Enhanced logging to show real activity
+    const out = { success: true, signedUrl, signature, timestamp: Date.now(), raw: result };
+
     const urlObj = new URL(url);
-    const pathParts = urlObj.pathname.split('/').filter(p => p);
-    const endpoint = pathParts.length > 0 ? pathParts[pathParts.length - 1] : 'root';
-    const params = urlObj.search ? `?${urlObj.searchParams.get('aid') || 'params'}` : '';
-    console.log(`🔐 SIGNED: ${endpoint}${params} | X-Bogus: ${signature?.substring(0, 16)}... | ${new Date().toLocaleTimeString()}`);
-    
+    const pathParts = urlObj.pathname.split("/").filter((p) => p);
+    const endpoint = pathParts.at(-1) || "root";
+    console.log(`🔐 SIGNED: ${endpoint} | X-Bogus: ${signature?.slice(0, 12)}... | ${new Date().toLocaleTimeString()}`);
+
     return res.json(out);
   } catch (err) {
     log.error({ err }, "Sign endpoint error");
@@ -223,7 +190,7 @@ app.all("/sign", async (req, res) => {
   }
 });
 
-// Optional admin route to re-load signer without restarting process
+// === RELOAD SIGNER MANUALLY ===
 app.post("/_reload_signer", async (req, res) => {
   try {
     signerReady = false;
@@ -237,5 +204,5 @@ app.post("/_reload_signer", async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  log.info(`Sign server listening on ${PORT} (signerReady=${signerReady})`);
+  log.info(`🚀 Sign server listening on ${PORT} (signerReady=${signerReady})`);
 });
