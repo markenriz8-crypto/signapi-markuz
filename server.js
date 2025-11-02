@@ -23,9 +23,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// === RATE LIMITER ===
+// === RATE LIMITER === (Increased for mass connections)
 const limiter = new RateLimiterMemory({
-  points: Number(process.env.RATE_LIMIT_POINTS || 60),
+  points: Number(process.env.RATE_LIMIT_POINTS || 200), // Increased from 60 to 200
   duration: Number(process.env.RATE_LIMIT_DURATION || 60),
 });
 
@@ -33,6 +33,31 @@ const limiter = new RateLimiterMemory({
 let signer = null;
 let signerReady = false;
 let signerInfo = { source: null };
+
+// === SIGNATURE CACHE FOR PERFORMANCE ===
+const signatureCache = new Map();
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+function getCachedSignature(url) {
+  const cached = signatureCache.get(url);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return cached.data;
+  }
+  return null;
+}
+
+function setCachedSignature(url, data) {
+  signatureCache.set(url, {
+    data,
+    timestamp: Date.now()
+  });
+  
+  // Clean old cache entries
+  if (signatureCache.size > 100) {
+    const oldestKey = signatureCache.keys().next().value;
+    signatureCache.delete(oldestKey);
+  }
+}
 
 // === LOAD SIGNER FUNCTION ===
 async function loadSigner() {
@@ -133,12 +158,19 @@ app.get("/", (req, res) => {
   });
 });
 
-// === SIGN ENDPOINT ===
+// === SIGN ENDPOINT === (With caching for performance)
 app.all("/sign", async (req, res) => {
   try {
     const url = (req.method === "GET" ? req.query.url : req.body?.url) || null;
     if (!url || typeof url !== "string") {
       return res.status(400).json({ success: false, error: "Missing 'url' parameter" });
+    }
+
+    // Check cache first for performance
+    const cached = getCachedSignature(url);
+    if (cached) {
+      console.log(`🚀 CACHED: ${url.split('/').pop()} | ${new Date().toLocaleTimeString()}`);
+      return res.json(cached);
     }
 
     if (!signerReady) await loadSigner();
@@ -177,6 +209,9 @@ app.all("/sign", async (req, res) => {
       return res.status(500).json({ success: false, error: "Could not normalize signer output", raw: result });
 
     const out = { success: true, signedUrl, signature, timestamp: Date.now(), raw: result };
+
+    // Cache the result for future requests
+    setCachedSignature(url, out);
 
     const urlObj = new URL(url);
     const pathParts = urlObj.pathname.split("/").filter((p) => p);
